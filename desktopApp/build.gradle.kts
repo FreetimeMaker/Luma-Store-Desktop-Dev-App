@@ -20,6 +20,7 @@ compose.desktop {
         mainClass = "com.freetime.lumadevs.MainKt"
 
         nativeDistributions {
+            modules("jdk.httpserver")
             targetFormats(TargetFormat.Exe, TargetFormat.Msi, TargetFormat.Deb, TargetFormat.Rpm)
             packageName = "com.freetime.lumadevs"
             packageVersion = "1.0.0"
