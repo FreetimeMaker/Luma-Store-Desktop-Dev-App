@@ -23,6 +23,7 @@ kotlinx-coroutinesSwing = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-s
 
 freetime-core = { module = "com.freetime:Core", version.ref = "freetime" }
 freetime-design = { module = "com.freetime:Design", version.ref = "freetime" }
+freetime-notifications = { module = "com.freetime:Notifications", version.ref = "freetime" }
 
 [plugins]
 composeMultiplatform = { id = "org.jetbrains.compose", version.ref = "composeMultiplatform" }
