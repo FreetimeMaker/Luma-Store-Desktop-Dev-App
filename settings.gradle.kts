@@ -24,6 +24,7 @@ dependencyResolutionManagement {
             }
         }
         mavenCentral()
+        maven("https://repo.free-time.me/maven/")
     }
 }
 
