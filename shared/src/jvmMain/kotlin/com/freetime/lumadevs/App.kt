@@ -8,7 +8,6 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.platform.LocalUriHandler
 import androidx.compose.ui.unit.dp
 import com.freetime.design.templates.expressive.FreetimeTheme
 import kotlinx.coroutines.CancellationException
@@ -16,7 +15,7 @@ import kotlinx.coroutines.launch
 import kotlinx.serialization.json.*
 
 private enum class Page(val label: String) {
-    Discover("Discover"), Apps("My apps"), Analytics("Analytics"), Status("Status"),
+    Apps("My apps"), Analytics("Analytics"), Status("Status"),
     Profile("Profile"), Funding("Funding"),
 }
 
@@ -24,7 +23,7 @@ private enum class Page(val label: String) {
 fun App() {
     val systemDark = isSystemInDarkTheme()
     var dark by rememberSaveable { mutableStateOf(systemDark) }
-    var page by rememberSaveable { mutableStateOf(Page.Discover) }
+    var page by rememberSaveable { mutableStateOf(Page.Apps) }
     var selected by remember { mutableStateOf<String?>(null) }
     var account by remember { mutableStateOf<String?>(null) }
     var error by remember { mutableStateOf<String?>(null) }
@@ -35,11 +34,14 @@ fun App() {
             DesktopAuth.sessionStatus.collect { account = DesktopAuth.currentSessionOrNull()?.user?.id }
         }
     }
+    LaunchedEffect(account) {
+        account?.let { watchAppStatuses(it) }
+    }
     FreetimeTheme(darkTheme = dark) {
         Surface(Modifier.fillMaxSize()) {
             Column(Modifier.fillMaxSize().padding(20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
                 Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                    Text("Luma Store", Modifier.weight(1f), style = MaterialTheme.typography.headlineMedium)
+                    Text("Luma Store Developer Console", Modifier.weight(1f), style = MaterialTheme.typography.headlineMedium)
                     OutlinedButton(onClick = { dark = !dark }) { Text(if (dark) "Light theme" else "Dark theme") }
                     if (account != null) OutlinedButton(enabled = !busy, onClick = {
                         busy = true
@@ -49,13 +51,8 @@ fun App() {
                         }
                     }) { Text("Sign out") }
                 }
-                FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Page.entries.forEach { destination ->
-                        FilterChip(page == destination, { page = destination; selected = null }, { Text(destination.label) })
-                    }
-                }
                 error?.let { Text(it, color = MaterialTheme.colorScheme.error) }
-                if (page != Page.Discover && account == null) {
+                if (account == null) {
                     Text("Sign in to manage your apps", style = MaterialTheme.typography.headlineSmall)
                     FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                         listOf("GitHub", "GitLab", "Codeberg").forEach { provider ->
@@ -71,6 +68,11 @@ fun App() {
                     }
                     if (busy) Text("Complete sign-in in your browser.")
                 } else {
+                    FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Page.entries.forEach { destination ->
+                            FilterChip(page == destination, { page = destination; selected = null }, { Text(destination.label) })
+                        }
+                    }
                     key(page, selected, account) {
                         LivePage(page, selected, onSelect = { selected = it })
                     }
@@ -85,29 +87,63 @@ private fun LivePage(page: Page, selected: String?, onSelect: (String?) -> Unit)
     var data by remember { mutableStateOf<JsonElement?>(null) }
     var failure by remember { mutableStateOf<String?>(null) }
     var refresh by remember { mutableIntStateOf(0) }
+    var latestSubmissions by remember { mutableStateOf<Map<String, JsonObject>>(emptyMap()) }
+    var downloads by remember { mutableStateOf<JsonObject?>(null) }
+    var metadataNotice by remember { mutableStateOf<String?>(null) }
+    var submissionNotice by remember { mutableStateOf<String?>(null) }
     var search by rememberSaveable { mutableStateOf("") }
-    val open = LocalUriHandler.current
     LaunchedEffect(refresh) {
         failure = null
         reportFailure({ failure = it }) {
             data = when (page) {
-                Page.Discover -> if (selected == null) DesktopData.catalog().getValue("apps") else DesktopData.catalogApp(selected)
-                Page.Apps -> if (selected == null) DesktopData.submissions() else DesktopData.submission(selected)
-                Page.Status -> if (selected == null) DesktopData.submissions() else DesktopData.submissionStatusHistory(selected)
-                Page.Analytics -> DesktopData.downloadStats()
+                Page.Apps -> if (selected == null) DesktopData.apps() else DesktopData.app(selected)
+                Page.Status -> if (selected == null) DesktopData.currentAppStatuses() else DesktopData.submissionStatusHistory(selected)
+                Page.Analytics -> DesktopData.analytics()
                 Page.Profile -> DesktopData.profile()
                 Page.Funding -> DesktopData.funding()
             } ?: JsonNull
+        }
+    }
+    LaunchedEffect(data, refresh) {
+        if (page != Page.Apps) return@LaunchedEffect
+        val apps = when (val result = data) {
+            is JsonArray -> result.filterIsInstance<JsonObject>()
+            is JsonObject -> listOf(result)
+            else -> return@LaunchedEffect
+        }
+        metadataNotice = null
+        if (apps.isEmpty()) return@LaunchedEffect
+        kotlinx.coroutines.coroutineScope {
+            launch {
+                reportFailure({ metadataNotice = "Latest review status could not be loaded." }) {
+                    latestSubmissions = DesktopData.latestSubmissionsByApp(apps)
+                }
+            }
+            launch {
+                reportFailure({ downloads = null }) {
+                    downloads = DesktopData.downloadStats()["stats"] as? JsonObject
+                }
+            }
         }
     }
     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
         if (selected != null) OutlinedButton(onClick = { onSelect(null) }) { Text("Back") }
         OutlinedButton(onClick = { refresh++ }) { Text("Refresh") }
         if (page == Page.Apps && selected == null) {
-            SubmissionActions(null, onSaved = { refresh++ })
+            AddAppButton { submission ->
+                val name = submission.text("name") ?: "App"
+                submissionNotice = "$name was submitted for review. Track it under Status."
+                refresh++
+            }
         }
     }
+    metadataNotice?.let { Text(it, color = MaterialTheme.colorScheme.error) }
+    submissionNotice?.let { Text(it, color = MaterialTheme.colorScheme.primary) }
     failure?.let { Text(it, color = MaterialTheme.colorScheme.error) }
+    if ((page == Page.Profile || page == Page.Funding) && data != null) {
+        DeveloperSettings(page == Page.Funding, data as? JsonObject) { refresh++ }
+        return
+    }
     when (val result = data) {
         null -> if (failure == null) LinearProgressIndicator(Modifier.fillMaxWidth())
         JsonNull -> Text("No record found.")
@@ -121,33 +157,24 @@ private fun LivePage(page: Page, selected: String?, onSelect: (String?) -> Unit)
                 items(entries) { row ->
                     val title = row.text("name") ?: row.text("status") ?: "Update"
                     DataCard(title, row.text("short_description") ?: row.text("review_message") ?: row.text("status")) {
+                        if (page == Page.Apps) AppListingMetadata(row, latestSubmissions[row.text("id")], downloads)
                         if (selected == null) row.text("id")?.let { id -> TextButton(onClick = { onSelect(id) }) { Text("Details") } }
                         else row.text("created_at")?.let { Text(it) }
                     }
                 }
             }
         }
-        is JsonObject -> LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        is JsonObject -> if (page == Page.Analytics) {
+            AnalyticsScreen(result)
+        } else LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
             when (page) {
-                Page.Discover -> {
-                    val app = result["app"] as? JsonObject ?: return@LazyColumn
-                    item { DataCard(app.text("name") ?: "App", app.text("description")) { app.text("developer_name")?.let { Text(it) } } }
-                    items((result["platforms"] as? JsonArray).orEmpty().filterIsInstance<JsonObject>()) { platform ->
-                        DataCard(platform.text("platform") ?: "Release", platform.text("package_type")) {
-                            platform.text("download_url")?.takeIf { it.startsWith("https://") }?.let { url ->
-                                TextButton(onClick = { try { open.openUri(url) } catch (_: Exception) { failure = "Could not open the download link." } }) { Text("Open download") }
-                            }
-                        }
-                    }
-                }
-                Page.Analytics -> {
-                    val stats = (result["stats"] as? JsonObject).orEmpty().values.filterIsInstance<JsonObject>()
-                    item { DataCard("Lifetime downloads", stats.sumOf { it.text("total")?.toLongOrNull() ?: 0 }.toString()) {} }
-                }
                 Page.Apps -> item {
-                    DataCard(result.text("name") ?: "Submission", result.text("description")) {
-                        result.text("status")?.let { Text(it) }
-                        SubmissionActions(result, onSaved = { refresh++ }, onDeleted = { onSelect(null) })
+                    DataCard(result.text("name") ?: "App", result.text("description") ?: result.text("short_description")) {
+                        result.text("package_name")?.let { Text(it) }
+                        AppListingMetadata(result, latestSubmissions[result.text("id")], downloads)
+                        result.text("license_type")?.let { Text("License: $it") }
+                        (result.text("repo_url") ?: result.text("source_code_url"))?.let { Text("Repository: $it") }
+                        AppMetadataEditor(result) { refresh++ }
                     }
                 }
                 else -> items(result.entries.toList()) { (label, value) ->
@@ -160,60 +187,27 @@ private fun LivePage(page: Page, selected: String?, onSelect: (String?) -> Unit)
 }
 
 @Composable
-private fun SubmissionActions(row: JsonObject?, onSaved: () -> Unit, onDeleted: () -> Unit = {}) {
-    var editing by remember { mutableStateOf(false) }
-    var deleting by remember { mutableStateOf(false) }
-    var busy by remember { mutableStateOf(false) }
-    var error by remember { mutableStateOf<String?>(null) }
-    val scope = rememberCoroutineScope()
-    val id = row?.text("id")
-    val draft = row == null || row.text("status") == "draft"
-    if (draft) Button(onClick = { editing = true; error = null }) { Text(if (id == null) "New draft" else "Edit draft") }
-    if (id != null) OutlinedButton(onClick = { deleting = true; error = null }) { Text("Delete or archive") }
-    if (editing) {
-        var name by remember { mutableStateOf(row?.text("name").orEmpty()) }
-        var description by remember { mutableStateOf(row?.text("description").orEmpty()) }
-        var repository by remember { mutableStateOf(row?.text("repo_url").orEmpty()) }
-        AlertDialog(
-            onDismissRequest = { if (!busy) editing = false },
-            title = { Text("Submission draft") },
-            text = { Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                OutlinedTextField(name, { name = it }, label = { Text("App name") })
-                OutlinedTextField(description, { description = it }, label = { Text("Description") })
-                OutlinedTextField(repository, { repository = it }, label = { Text("Repository URL") })
-                error?.let { Text(it, color = MaterialTheme.colorScheme.error) }
-            } },
-            confirmButton = { Button(enabled = !busy && name.isNotBlank(), onClick = {
-                busy = true
-                error = null
-                scope.launch {
-                    try { reportFailure({ error = it }) {
-                        DesktopData.saveSubmission(buildJsonObject {
-                            row?.forEach { (key, value) -> put(key, value) }
-                            put("name", name.trim()); put("description", description.trim()); put("repo_url", repository.trim())
-                        }, editingId = id, draft = true, draftStep = row?.text("draft_step")?.toIntOrNull() ?: 1)
-                        editing = false
-                        onSaved()
-                    } } finally { busy = false }
-                }
-            }) { Text("Save draft") } },
-            dismissButton = { TextButton(enabled = !busy, onClick = { editing = false }) { Text("Cancel") } },
-        )
-    }
-    if (deleting && id != null) AlertDialog(
-        onDismissRequest = { if (!busy) deleting = false },
-        title = { Text("Delete or archive submission?") },
-        text = { Text(error ?: "The server decides whether this submission can be deleted or must be archived.") },
-        confirmButton = { Button(enabled = !busy, onClick = {
-            busy = true
-            error = null
-            scope.launch {
-                try { reportFailure({ error = it }) { DesktopData.deleteSubmission(id); deleting = false; onDeleted() } }
-                finally { busy = false }
+private fun AppListingMetadata(app: JsonObject, submission: JsonObject?, downloads: JsonObject?) {
+    val archived = !app.text("archived_at").isNullOrBlank() || app.text("status").equals("Archived", true)
+    val status = if (archived) "Archived" else "Published"
+    val review = submission?.text("status")
+    val version = app.text("version")?.takeIf { it.isNotBlank() } ?: "No version"
+    val category = app.text("category") ?: submission?.text("category") ?: app.text("subcategory")
+    val platform = app.text("platform") ?: submission?.text("platform")
+    FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        Badge { Text(status) }
+        if (!archived && review != null && review !in setOf("Approved", "Archived")) {
+            val label = if (review == "Pending" || review == "In Review") "In review" else review
+            val submittedVersion = submission.text("version")?.takeIf { it.isNotBlank() }
+            Badge(containerColor = MaterialTheme.colorScheme.secondaryContainer,
+                contentColor = MaterialTheme.colorScheme.onSecondaryContainer) {
+                Text(listOfNotNull(label, submittedVersion).joinToString(" · "))
             }
-        }) { Text("Confirm") } },
-        dismissButton = { TextButton(enabled = !busy, onClick = { deleting = false }) { Text("Cancel") } },
-    )
+        }
+    }
+    Text(listOfNotNull(category, platform, version).joinToString(" · "))
+    app.text("version_code")?.let { Text("Version code: $it") }
+    (downloads?.get(app.text("id")) as? JsonObject)?.text("total")?.let { Text("All-time downloads: $it") }
 }
 
 @Composable
@@ -236,6 +230,7 @@ private suspend fun reportFailure(onError: (String) -> Unit, block: suspend () -
         throw cancelled
     } catch (failure: Exception) {
         onError(when (failure) {
+            is DesktopSignInException -> failure.message.orEmpty()
             is DesktopData.WebsiteException -> if (failure.deploymentDisabled) "The website deployment is currently unavailable." else "Website request failed (HTTP ${failure.status})."
             is IllegalStateException -> failure.message?.takeIf { it.startsWith("Supabase is not configured") } ?: "The operation could not be completed."
             else -> "The operation could not be completed. Check your connection and try again."

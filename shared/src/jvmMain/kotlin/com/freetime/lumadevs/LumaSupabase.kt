@@ -3,7 +3,7 @@ package com.freetime.lumadevs
 import io.github.jan.supabase.auth.Auth
 import io.github.jan.supabase.auth.FlowType
 import io.github.jan.supabase.auth.MemoryCodeVerifierCache
-import io.github.jan.supabase.auth.MemorySessionManager
+
 import io.github.jan.supabase.createSupabaseClient
 import io.github.jan.supabase.postgrest.Postgrest
 import io.github.jan.supabase.storage.Storage
@@ -12,14 +12,14 @@ import io.ktor.client.engine.cio.CIO
 internal object LumaSupabase {
     val client by lazy {
         createSupabaseClient(
-            supabaseUrl = requiredEnv("SUPABASE_URL", "NEXT_PUBLIC_SUPABASE_URL"),
-            supabaseKey = requiredEnv("SUPABASE_PUBLISHABLE_KEY", "NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY")
+            supabaseUrl = "https://ndlaevedujqxhygbyxfh.supabase.co",
+                supabaseKey = "sb_publishable_HlppI4ILiXV7DZkpyrDEhQ_ytb2vV6g"
         ) {
             httpEngine = CIO.create()
             install(Auth) {
                 flowType = FlowType.PKCE
-                autoLoadFromStorage = false
-                sessionManager = MemorySessionManager()
+                autoLoadFromStorage = true
+                autoSaveToStorage = true
                 codeVerifierCache = MemoryCodeVerifierCache()
             }
             install(Postgrest)

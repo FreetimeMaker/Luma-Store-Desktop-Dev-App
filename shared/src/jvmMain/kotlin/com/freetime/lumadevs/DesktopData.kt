@@ -1,6 +1,7 @@
 package com.freetime.lumadevs
 
 import io.github.jan.supabase.auth.auth
+import io.github.jan.supabase.postgrest.exception.PostgrestRestException
 import io.github.jan.supabase.postgrest.from
 import io.github.jan.supabase.postgrest.postgrest
 import io.github.jan.supabase.postgrest.query.Columns
@@ -12,11 +13,15 @@ import io.ktor.client.plugins.HttpTimeout
 import io.ktor.client.request.*
 import io.ktor.client.statement.bodyAsText
 import io.ktor.http.*
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.ensureActive
 import kotlinx.serialization.json.*
 import java.io.IOException
+import java.time.OffsetDateTime
+import java.time.format.DateTimeParseException
 import javax.net.ssl.SSLException
 import kotlin.coroutines.coroutineContext
 
@@ -36,74 +41,94 @@ object DesktopData {
 
     class WebsiteException(val status: Int, message: String, val deploymentDisabled: Boolean = false) : IllegalStateException(message)
 
-    /** Discover data from app/page.tsx. There is no website JSON catalog route. */
-    suspend fun catalog(): JsonObject = coroutineScope {
-        val apps = async {
-            rows("store_apps", "id,name,short_description,description,developer_name,icon_url,version,package_name,repo_url,license_type,subcategory,categories,created_at,updated_at,latest_detected_version,latest_detected_at") {
-                filter { exact("archived_at", null) }
-                order("updated_at", Order.DESCENDING)
-                order("id", Order.ASCENDING)
-            }
-        }
-        val platforms = async {
-            rows("store_app_platforms", "app_id,platform,listing_metadata") { order("id", Order.ASCENDING) }
-        }
-        val ratings = async {
-            rows("store_app_ratings", "app_id,rating", stableOrder = "app_id,rating")
-        }
-        val metrics = async { rpc("luma_discover_metrics") }
-        buildJsonObject {
-            put("apps", apps.await())
-            put("platforms", platforms.await())
-            put("ratings", ratings.await())
-            put("metrics", metrics.await())
+    /** Published apps are read from public.apps, scoped to the signed-in developer. */
+    suspend fun apps(): JsonArray = coroutineScope {
+        val apps = ownedApps().filterIsInstance<JsonObject>()
+        val releaseDates = apps.mapNotNull { it.text("package_name")?.takeIf(String::isNotBlank) }
+            .distinct().chunked(6).flatMap { batch ->
+                batch.map { name -> async { name to latestRelease(name) } }.awaitAll()
+            }.toMap()
+        JsonArray(apps.sortedWith(compareByDescending<JsonObject> { app ->
+            releaseDates[app.text("package_name")] ?: parseTimestamp(app.text("created_at"))
+        }.thenBy { it.text("id") }))
+    }
+
+    private suspend fun ownedApps(): JsonArray {
+        val owner = userId()
+        return withAppsTable { table ->
+            rows(table, "*", stableOrder = "id") { filter { eq("developer_id", owner) } }
         }
     }
 
-    /** Public listing detail, looked up by UUID or Android package name. */
-    suspend fun catalogApp(identifier: String): JsonObject? {
-        require(identifier.isNotBlank())
-        val key = if (UUID.matches(identifier)) "id" else "package_name"
-        val app = client.from("store_apps").select(Columns.raw(
-            "id,name,description,developer_name,developer_id,category_id,icon_url,version,created_at,updated_at,luma_submission_id,package_name,version_code,subcategory,license_type,short_description,screenshots,changelog,ant_features,author_name,author_email,author_website,website_url,source_code_url,repo_url,issue_tracker_url,translation_url,changelog_url,donate_url,liberapay,opencollective,bitcoin,litecoin,categories"
-        )) {
-            filter { exact("archived_at", null); eq(key, identifier) }
-            order("updated_at", Order.DESCENDING)
-            order("id", Order.ASCENDING)
-            limit(1)
-        }.decodeList<JsonObject>().firstOrNull() ?: return null
-        val id = app.getValue("id").jsonPrimitive.content
-        val target = buildJsonObject { put("target_app_id", id) }
-        return coroutineScope {
-            val platforms = async {
-                rows("store_app_platforms", "id,app_id,platform,package_type,linux_package_base,download_url,file_size_mb,sha256,artifact_verified_at,artifact_size_bytes,permissions,repo_url,listing_metadata") {
-                    filter { eq("app_id", id) }; order("platform", Order.ASCENDING); order("id", Order.ASCENDING)
-                }
-            }
-            val downloads = async { rpc("luma_app_download_count", target) }
-            val platformDownloads = async { rpc("luma_app_platform_download_counts", target) }
-            val versions = async {
-                app.text("package_name")?.let { name ->
-                    rpc("luma_public_version_history", buildJsonObject { put("target_package_name", name) })
-                } ?: JsonArray(emptyList())
-            }
-            val funding = async { app.text("developer_id")?.let { fundingFor(it) } }
-            buildJsonObject {
-                put("app", app)
-                put("platforms", platforms.await())
-                put("totalDownloads", downloads.await())
-                put("platformDownloads", platformDownloads.await())
-                put("versions", versions.await())
-                put("funding", funding.await() ?: JsonNull)
-            }
+    private suspend fun latestRelease(packageName: String): java.time.Instant? = try {
+        // Same publication history as the website app detail, not the mutable listing timestamp.
+        val history = rpc("luma_public_version_history", buildJsonObject {
+            put("target_package_name", packageName)
+        }) as? JsonArray
+        history?.filterIsInstance<JsonObject>()?.mapNotNull { parseTimestamp(it.text("published_at")) }?.maxOrNull()
+    } catch (cancelled: CancellationException) {
+        throw cancelled
+    } catch (_: Exception) {
+        null // Older deployments may not expose history; keep the list usable without using updated_at.
+    }
+
+    private fun parseTimestamp(value: String?) = value?.let {
+        try { OffsetDateTime.parse(it).toInstant() } catch (_: DateTimeParseException) { null }
+    }
+
+    suspend fun app(id: String): JsonObject? {
+        val owner = userId()
+        return withAppsTable { table ->
+            one(table, "*") { filter { eq("developer_id", owner); eq("id", id) } }
         }
     }
 
-    /** Owner-scoped submission rows, newest first, including drafts and archived entries. */
-    suspend fun submissions(): JsonArray = submissionRows(userId())
+    private suspend fun <T> withAppsTable(query: suspend (String) -> T): T = try {
+        query("apps")
+    } catch (failure: PostgrestRestException) {
+        // The deployed schema exposes store_apps instead of apps (PostgREST PGRST205).
+        if (failure.code != "PGRST205") throw failure
+        query("store_apps")
+    }
+
+    /** Submission rows are newest first; show only the current status for an app. */
+    suspend fun currentAppStatuses(): JsonArray {
+        val submissions = submissionRows(userId()).filterIsInstance<JsonObject>().sortedWith(submissionRecency)
+        val published = ownedApps().filterIsInstance<JsonObject>()
+        val bySubmission = published.mapNotNull { row -> row.text("luma_submission_id")?.let { it to row } }.toMap()
+        val byApp = published.associateBy { it.text("id") }
+        return JsonArray(submissions.distinctBy { row ->
+            val app = bySubmission[row.text("id")] ?: row.text("store_app_id")?.let { byApp[it] }
+            val packageName = (row.text("package_name") ?: app?.text("package_name"))?.trim()?.takeIf { it.isNotEmpty() }
+            if (packageName != null) "package:$packageName"
+            else app?.text("id")?.let { "app:$it" } ?: "submission:${row.text("id")}"
+        })
+    }
 
     suspend fun submission(id: String): JsonObject? = one("luma_submissions", "*") {
         filter { eq("user_id", userId()); eq("id", id) }
+    }
+
+    internal suspend fun latestSubmissionsByApp(apps: List<JsonObject>): Map<String, JsonObject> {
+        val latest = submissionRows(userId()).filterIsInstance<JsonObject>().sortedWith(submissionRecency)
+        val byId = latest.associateBy { it.text("id") }
+        val byApp = latest.groupBy { it.text("store_app_id") }
+        return apps.mapNotNull { app ->
+            val id = app.text("id") ?: return@mapNotNull null
+            val canonical = app.text("luma_submission_id")?.let(byId::get)
+            val submission = (byApp[id].orEmpty() + listOfNotNull(canonical)).minWithOrNull(submissionRecency)
+            submission?.let { id to it }
+        }.toMap()
+    }
+
+    internal suspend fun latestLinkedSubmission(appId: String, canonicalId: String?): JsonObject? {
+        val owner = userId()
+        val linked = rows("luma_submissions", "*", stableOrder = "id") {
+            filter { eq("user_id", owner); eq("store_app_id", appId) }
+        }.filterIsInstance<JsonObject>()
+        val canonical = canonicalId?.takeIf { id -> linked.none { it.text("id") == id } }
+            ?.let { submission(it) }
+        return (linked + listOfNotNull(canonical)).sortedWith(submissionRecency).firstOrNull()
     }
 
     /** Mirrors the website POST envelope. Only developer-editable metadata is forwarded. */
@@ -304,9 +329,16 @@ object DesktopData {
     private suspend fun rpc(name: String, params: JsonObject? = null): JsonElement =
         Json.parseToJsonElement(if (params == null) client.postgrest.rpc(name).data else client.postgrest.rpc(name, params).data)
 
+    private val submissionRecency = compareByDescending<JsonObject> { row ->
+        listOf("updated_at", "status_updated_at", "draft_updated_at", "submitted_at").mapNotNull { key ->
+            row.text(key)?.let { value ->
+                try { OffsetDateTime.parse(value).toInstant() } catch (_: DateTimeParseException) { null }
+            }
+        }.maxOrNull()
+    }.thenBy { it.text("id") }
+
     private fun JsonObject.text(key: String): String? = (get(key) as? JsonPrimitive)?.contentOrNull
 
-    private val UUID = Regex("[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}", RegexOption.IGNORE_CASE)
     private val editableFields = setOf(
         "name", "short_description", "description", "link", "repo_url", "source_code_url", "category",
         "categories", "subcategory", "license_type", "closed_source", "localized_metadata", "icon_url",

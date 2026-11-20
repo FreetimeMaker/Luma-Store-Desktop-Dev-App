@@ -8,6 +8,7 @@ import io.github.jan.supabase.auth.providers.Gitlab
 import io.github.jan.supabase.auth.providers.OAuthProvider
 import io.github.jan.supabase.auth.status.SessionStatus
 import io.github.jan.supabase.auth.user.UserSession
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.NonCancellable
@@ -22,6 +23,8 @@ import java.net.URI
 import java.net.URLDecoder
 import java.util.UUID
 import kotlin.time.Duration.Companion.minutes
+
+internal class DesktopSignInException(message: String) : IllegalStateException(message)
 
 internal object DesktopAuth {
     private val auth get() = LumaSupabase.client.auth
@@ -52,7 +55,13 @@ internal object DesktopAuth {
                         scopes.addAll(requestedScopes.split(' '))
                     }
                 }
-                sdk.exchangeCodeForSession(code)
+                try {
+                    sdk.exchangeCodeForSession(code)
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (_: Exception) {
+                    throw DesktopSignInException("The browser returned to the app, but the Supabase session could not be created. Check your connection and the Supabase Auth logs.")
+                }
             } finally {
                 withContext(NonCancellable) { sdk.codeVerifierCache.deleteCodeVerifier() }
             }
@@ -73,9 +82,7 @@ internal object DesktopAuth {
     // Keep the listener code-only; the SDK still generates the PKCE challenge and exchanges the code.
     private suspend fun awaitAuthorizationCode(authorizeUrl: (String) -> String): String =
         withContext(Dispatchers.IO) {
-            check(Desktop.isDesktopSupported() && Desktop.getDesktop().isSupported(Desktop.Action.BROWSE)) {
-                "No system browser is available for sign-in."
-            }
+
             val path = "/oauth/callback/${UUID.randomUUID()}"
             val result = CompletableDeferred<String>()
             val server = HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0)
@@ -85,13 +92,30 @@ internal object DesktopAuth {
                 }
                 server.start()
                 val redirect = "http://127.0.0.1:${server.address.port}$path"
-                Desktop.getDesktop().browse(URI(authorizeUrl(redirect)))
+                openBrowser(URI(authorizeUrl(redirect)))
                 withTimeoutOrNull(3.minutes) { result.await() }
-                    ?: error("Sign-in timed out. Check the browser and try again.")
+                    ?: throw DesktopSignInException("No sign-in response reached the app. Check the browser and the Supabase loopback redirect allowlist.")
             } finally {
                 server.stop(0)
             }
         }
+
+    private fun openBrowser(uri: URI) {
+        if (runCatching {
+            if (!Desktop.isDesktopSupported() || !Desktop.getDesktop().isSupported(Desktop.Action.BROWSE)) false
+            else { Desktop.getDesktop().browse(uri); true }
+        }.getOrDefault(false)) return
+
+        if (System.getProperty("os.name").startsWith("Linux", ignoreCase = true)) {
+            if (runCatching {
+                ProcessBuilder("xdg-open", uri.toASCIIString())
+                    .redirectOutput(ProcessBuilder.Redirect.DISCARD)
+                    .redirectError(ProcessBuilder.Redirect.DISCARD)
+                    .start()
+            }.isSuccess) return
+        }
+        throw DesktopSignInException("Could not open the default browser. Configure a system browser and try again.")
+    }
 
     private fun handleCallback(exchange: HttpExchange, path: String, result: CompletableDeferred<String>) {
         if (exchange.requestMethod != "GET" || exchange.requestURI.rawPath != path) {
@@ -120,7 +144,7 @@ internal object DesktopAuth {
             exchange.responseBody.use { it.write(body) }
         } finally {
             when {
-                failed -> result.completeExceptionally(IllegalStateException(message))
+                failed -> result.completeExceptionally(DesktopSignInException("The provider declined sign-in or Supabase rejected it. Check the browser or the Supabase Auth logs."))
                 code != null -> result.complete(code)
             }
         }

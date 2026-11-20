@@ -23,6 +23,7 @@ kotlin {
             implementation(libs.androidx.lifecycle.runtimeCompose)
         }
         jvmMain.dependencies {
+            implementation(libs.freetime.notifications)
             implementation(libs.ktor.client.cio)
         }
         commonTest.dependencies {
