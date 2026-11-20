@@ -19,5 +19,3 @@ The desktop app reads submissions, status history, profile, and funding from Sup
 Use the run button in your IDE's editor gutter, or run tests using Gradle tasks:
 
 - Desktop tests: `./gradlew :shared:jvmTest`
-
----
